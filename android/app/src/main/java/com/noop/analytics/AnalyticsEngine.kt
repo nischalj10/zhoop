@@ -79,18 +79,24 @@ object AnalyticsEngine {
      * Pair the strap's WRIST_OFF/WRIST_ON events into off-wrist [start, end) intervals for the sleep
      * detector's fractional wear filter (#500; design credited to j0b-dev's #504). Each WRIST_OFF opens
      * an interval that closes at the next WRIST_ON, or at [windowEnd] if the strap is still off at the
-     * end of the read window. Events need not be pre-sorted; kinds are formatted "NAME(n)" (e.g.
-     * "WRIST_OFF(10)"), matched by prefix. Repeated OFFs/ONs without a partner are coalesced. Mirrors Swift.
+     * end of the read window. An unmatched tail may end earlier when sustained valid HR resumes;
+     * explicit OFF/ON pairs are never shortened. Events need not be pre-sorted; kinds are formatted "NAME(n)" (e.g.
+     * "WRIST_OFF(10)"), matched by prefix. Repeated OFFs/ONs without a partner are coalesced.
+     * Swift twin: `AnalyticsEngine.offWristIntervals`.
      */
-    fun offWristIntervals(events: List<EventRow>, windowEnd: Long): List<Pair<Long, Long>> {
+    fun offWristIntervals(events: List<EventRow>, windowEnd: Long,
+                          hr: List<HrSample> = emptyList()): List<Pair<Long, Long>> {
         val wear = events
             .filter { it.kind.startsWith("WRIST_OFF") || it.kind.startsWith("WRIST_ON") }
             .sortedBy { it.ts }
         val intervals = ArrayList<Pair<Long, Long>>()
         var offStart: Long? = null
+        var lastOff: Long? = null
         for (e in wear) {
+            if (e.ts > windowEnd) continue
             if (e.kind.startsWith("WRIST_OFF")) {
-                if (offStart == null) offStart = e.ts            // ignore repeated OFFs
+                if (offStart == null) offStart = e.ts
+                lastOff = e.ts // a repeated OFF invalidates evidence before it
             } else {                                             // WRIST_ON closes an open off-wrist span
                 val s = offStart
                 if (s != null && e.ts > s) intervals.add(s to e.ts)
@@ -98,7 +104,10 @@ object AnalyticsEngine {
             }
         }
         val s = offStart
-        if (s != null && windowEnd > s) intervals.add(s to windowEnd)
+        if (s != null && windowEnd > s) {
+            val end = WristWearRecovery.firstSustainedHR(hr, lastOff ?: s, windowEnd) ?: windowEnd
+            if (end > s) intervals.add(s to end)
+        }
         return intervals
     }
 
@@ -142,12 +151,52 @@ object AnalyticsEngine {
      * This is a UTC midnight that callers pair with one captured offset and fixed 86,400-second blocks, so
      * every boundary beyond a clock change sits an hour from the local midnight it names. [LocalDayWindows]
      * is the zone-rule-correct primitive built to replace that, and is deliberately called by nothing yet.
-     * This function remains the shipped answer until a switch-over lands; the two disagree by an hour on
-     * the far side of a transition, and `LocalDayWindowsTest` pins both answers so the difference is
-     * visible rather than discovered.
+     * This function remains the shipped answer; the two disagree by an hour on the far side of a
+     * transition, and `LocalDayWindowsTest` pins both answers so the difference is visible rather than
+     * discovered.
+     *
+     * THE 24-HOUR DAY IS NOW A DECISION RATHER THAN AN OPEN QUESTION (#2517). A transition day stays
+     * 86,400 seconds wide and the hour it misplaces is RECORDED instead of corrected, by
+     * [dayWindowSkewLine] below. What that buys is stated on that function: scoring keeps one
+     * definition of a day, the per-sample integer window keeps its cost, and no stored day row moves.
      */
     fun dayStartUtcSeconds(day: String): Long =
         runCatching { LocalDate.parse(day).atStartOfDay(ZoneOffset.UTC).toEpochSecond() }.getOrDefault(0L)
+
+    /**
+     * The line a scored day emits when the local day it names is NOT the 86,400 seconds the day window
+     * assumes (#2517). `null` on every ordinary day, which is the point: this costs one integer compare on
+     * the 363 days a year that have nothing to say.
+     *
+     * ALWAYS-ON rather than Test-Centre gated, and deliberately so. A clock change is the textbook
+     * rare-event evidence the contribution guide says to leave always-on: it costs nothing when nothing
+     * happens, it is exactly what is missing when somebody reports a strange day without a diagnostic
+     * profile enabled, and it happens twice a year rather than twice a minute.
+     *
+     * WHAT IT ASSERTS, and no more. The day window is 86,400 seconds; the local day is
+     * `86400 + (offsetAtStart - offsetAtFixedEnd)` seconds, because an offset that drops by an hour
+     * lengthens the day by one. So the line names the real length, the window's length, and the signed
+     * difference. It does NOT say which samples moved or which day they landed in: knowing that needs a
+     * scan of the samples, this is derived from two offsets, and a line that claimed it would be
+     * asserting more than it observed.
+     *
+     * Offsets rather than a zone identifier, and integers rather than names, for two reasons. A strap log
+     * already carries the UTC offset, so this adds no new location detail about the person reading it,
+     * where a zone name would. And the arithmetic is exact for any transition size, including the 30- and
+     * 45-minute ones, which a hardcoded 3,600 would quietly get wrong.
+     *
+     * Cross-checked against [LocalDayWindows], which computes the same length from the zone rules
+     * instead: `AnalyticsEngineDayWindowSkewTest` asserts this arithmetic reproduces the 90,000 and
+     * 82,800 second days that the committed `local_day_windows_oracle.json` already pins, so the cheap
+     * path and the correct one are held to the same answer. Swift twin: `dayWindowSkewLine`.
+     */
+    fun dayWindowSkewLine(day: String, offsetAtStart: Long, offsetAtFixedEnd: Long): String? {
+        if (offsetAtStart == offsetAtFixedEnd) return null
+        val realSeconds = 86_400L + (offsetAtStart - offsetAtFixedEnd)
+        val skewMin = (realSeconds - 86_400L) / 60L
+        return "day-window-skew day=$day realS=$realSeconds windowS=86400 skewMin=$skewMin " +
+            "offsetStart=$offsetAtStart offsetEnd=$offsetAtFixedEnd policy=keep-24h"
+    }
 
     /**
      * JSON-encode stage segments to the verbatim array shape the sleepSession cache
@@ -576,15 +625,13 @@ object AnalyticsEngine {
         // only way to scope them is through the session set itself — which is precisely the "one forgotten
         // call site" a scattered filter invites.
         val physiologySessions = matched.filter { !it.hrOnly }.ifEmpty { matched }
-        // Resting Heart Rate: Use PrimarySessionRestingHR (arithmetic sample mean of the longest/primary
-        // sleep session, #1169), eliminating daytime nap floor distortion.
-        // #804: Preserve ring/device-provided resting HR when present in `providedSleep`.
-        // Cleanly falls back to physiologySessions.mapNotNull { it.restingHR }.minOrNull() when coverage is sparse.
-        val providedPrimaryRHR = physiologySessions.maxByOrNull { it.end - it.start }
+        // #2522: use the gated lowest five-minute bin from the primary session, not its whole-session
+        // mean. Choosing the session first preserves #2358's nap protection; a shorter nap must not
+        // supply the daily RHR when the main night has no HR. #804's device-provided value still wins.
+        val primarySession = physiologySessions.maxByOrNull { it.end - it.start }
+        val providedPrimaryRHR = primarySession
             ?.let { p -> providedSleep.firstOrNull { it.start == p.start && it.end == p.end }?.restingHR }
-        val restingHRDaily: Int? = providedPrimaryRHR
-            ?: primarySessionRestingHR(physiologySessions, hr)?.roundToInt()
-            ?: physiologySessions.mapNotNull { it.restingHR }.minOrNull()
+        val restingHRDaily: Int? = providedPrimaryRHR ?: primarySession?.restingHR
         // Daily avg HRV = in-bed-weighted mean of per-session avg HRV.
         val avgHRVDaily: Double? = if (deepHrvWindow) {
             // #141: WHOOP-style HRV — pool RMSSD over DEEP-stage 5-min windows only (slow-wave sleep),
@@ -836,6 +883,33 @@ object AnalyticsEngine {
             diag = strainDiag,
             day = day,
         )
+        // #2438 step 0 asks two things of a contributed log: whether the day was scored against the
+        // user's own setting or against the age formula, and how far the day's own heart rate ran above
+        // that. The `effort score` line above answers neither — it collapses override and Tanaka into one
+        // word, and never reports what the day reached. The branch is only visible HERE, because [strain]
+        // is handed an HRmax with its provenance already gone. Built only when a sink is attached, and it
+        // changes no score.
+        strainDiag?.let { sink ->
+            val hrForPeak = dayHr ?: hr
+            sink(
+                StrainScorer.dayCalibrationLine(
+                    day = day,
+                    // The value the day was actually scored against, which for an age-less profile is
+                    // the one [StrainScorer.strain] substitutes internally rather than null. Reporting
+                    // null there would put this line in direct contradiction with the `effort score`
+                    // line above it, which prints that substituted number, about the same day.
+                    hrmax = effMaxHR ?: StrainScorer.defaultMaxHR().toDouble(),
+                    hrmaxSource = if (maxHROverride != null) "override"
+                    else if (profile.age > 0) "tanaka" else "default",
+                    tanaka = if (profile.age > 0) StrainScorer.tanakaHRmax(profile.age) else null,
+                    observedPeak = hrForPeak.maxOfOrNull { it.bpm }?.toDouble(),
+                    restingHR = restForStrain,
+                ) +
+                    // The raw peak is usually one isolated sample on a ring; this is the value held (#2438).
+                    StrainScorer.sustainedPeakField(StrainScorer.sustainedPeak(hrForPeak)) +
+                    StrainScorer.sustainedPeakSpanField(StrainScorer.sustainedPeakSpan(hrForPeak)),
+            )
+        }
 
         // ── Workouts ──────────────────────────────────────────────────────────
         // Detect over the full CALENDAR day (dayHr/dayGravity) when supplied so a current-day

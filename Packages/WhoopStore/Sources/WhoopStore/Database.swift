@@ -496,7 +496,12 @@ extension WhoopStore {
                 t.column("fetchedAt", .integer).notNull()    // unix seconds
                 t.primaryKey(["deviceId", "endpoint", "documentId"])
             }
-            // Per-endpoint reads scan (deviceId, endpoint) then walk day in order.
+            // Serves the (deviceId, endpoint) lookup. It no longer serves the ORDER BY: `ouraRaw`
+            // sorts by (fetchedAt, rowid) because page producers leave `day` nil, so an all-nil
+            // `day` made the old `ORDER BY day ASC` degenerate to whatever order SQLite returned.
+            // The trailing `day` column stays useful for day-keyed lookups; the sort happens after
+            // the scan. An index on (deviceId, endpoint, fetchedAt) is the change to make if this
+            // archive ever grows enough for that sort to matter.
             try db.create(index: "idx_ouraRaw_device_endpoint_day",
                           on: "ouraRaw", columns: ["deviceId", "endpoint", "day"])
         }
@@ -1090,6 +1095,63 @@ extension WhoopStore {
             // Replaying one session in order.
             try db.create(index: "idx_liftSet_session_ord", on: "liftSet",
                           columns: ["sessionId", "ord"], options: [.ifNotExists])
+        }
+        // v47 (#2371): mark the WHOOP 5 500 ms fill beats already stored, with the rule `insert` applies to
+        // every new batch (`WhoopStore.whoop5RrFillFlagSQL`). Data only, no schema change, and a MARK in
+        // the v35 form, never a delete: the rows stay on disk. Twin of Room
+        // MIGRATION_40_41.
+        migrator.registerMigration("v47-rr-whoop5-fill") { db in
+            try db.execute(sql: WhoopStore.whoop5RrFillMigrationSQL)
+        }
+
+        // v48 (#2847): the flash-banked MG ECG record gets somewhere to live. `TOGGLE_LABRADOR_RAW_SAVE`
+        // banks an ECG generation to the strap's flash as type-47 / revision-16 records, which arrive in
+        // the ordinary history offload; #2839 landed the decoder for them and this is the table that decode
+        // was missing. Twin of the Android `ecgWaveformSample` (MIGRATION_41_42); same column order and the
+        // same primary key, so a `.noopbak` round-trips byte-for-byte.
+        //
+        // `record` is the record's INNER bytes verbatim, all `Whoop5Ecg.r16InnerLength` of them, and the
+        // reasoning for storing the wire form rather than a decoded field set is on `EcgWaveformSample`:
+        // the samples are signed 18-BIT so no integer blob fits them, the lead-off halfwords have no
+        // attested byte order, and `Whoop5Ecg.parseR16` is already pinned byte-for-byte as the reader.
+        // @meta1971 measured samples reaching +/-126,977 over 13,178,493 of them, which is what settles
+        // the width question with data rather than with a guess.
+        //
+        // `sequence` is the strap's own record index, lifted out of `record` so a reading can be ordered
+        // and gap-checked in SQL without unpacking 1,572 bytes a row. It is written from the same decode
+        // that produced `record`, never from a second reading of those bytes.
+        //
+        // IT IS ALSO IN THE PRIMARY KEY, which is where this table differs from every per-second stream
+        // beside it, and the difference is load-bearing. A (deviceId, ts) key assumes one record per
+        // strap-second. R16 does not keep that promise at the START of a reading: the record carries a
+        // `subseconds` field at all, and the opening records of a real run declare 0 samples and then 245
+        // before the first full 500, so two of them can be stamped inside the same second. Keyed on the
+        // second alone, the second record of that pair hit ON CONFLICT DO NOTHING and was dropped
+        // silently, which a test on this table now proves rather than assumes. Re-offloading the same
+        // record still dedupes, because its ts AND its sequence both repeat.
+        //
+        // WHY THIS IS NOT THE RAW ARCHIVE AGAIN. `RawHistoryArchive` is a 5 MiB forensic ring whose
+        // per-version floor protects 64 informative lines, which for a record of one strap-second is 64
+        // seconds of waveform; @DX23876 measured an ECG reading evicted down to that floor within a
+        // couple of hours on a live MG, because R20 and R21 records compete for the same file constantly.
+        // These rows are per device, bounded by their own cap, and nothing else competes for the space.
+        //
+        // Retention: CAPPED at `WhoopStore.ecgWaveformRetentionRows` newest rows per device, swept by the
+        // insert path. Not a time window, for the reason spelled out on that constant.
+        //
+        // NOTHING READS THESE ROWS YET, and that is not an oversight to be tidied away. #752 bounds what
+        // may be read off this signal at all: no rhythm classification of ours, no alerts, no clinical
+        // wording. The rows are the point, so that a later analysis, or a waveform viewer, can run over
+        // the ORIGINAL samples instead of over whatever summary we would otherwise have had to invent at
+        // ingest time. Do not "clean up" this table or its reader as dead code.
+        migrator.registerMigration("v48-ecg-waveform") { db in
+            try db.create(table: "ecgWaveformSample") { t in
+                t.column("deviceId", .text).notNull()
+                t.column("ts", .integer).notNull()
+                t.column("sequence", .integer).notNull()
+                t.column("record", .blob).notNull()
+                t.primaryKey(["deviceId", "ts", "sequence"])
+            }
         }
         return migrator
     }

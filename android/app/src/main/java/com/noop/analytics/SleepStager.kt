@@ -19,7 +19,11 @@ import kotlin.math.sqrt
  * itself ported from server/ingest/app/analysis/sleep.py and sleep_features.py.
  *
  * HONEST HEDGING: these stages are APPROXIMATIONS, not PSG-validated, not medical
- * advice. The EEG-free 4-class ceiling is ~65–73% epoch agreement (Walch 2019).
+ * advice. No four-class ceiling is quoted here, and the reason is a correction (#2835): this line used to
+ * cite "~65–73% epoch agreement (Walch 2019)" for one, but Walch et al. (2019) report a THREE-class task
+ * (wake/NREM/REM, about 72%) and a separate two-class sleep/wake result near 90%, attempting no
+ * light/deep separation at all. The four classes staged below are a harder problem than the three that
+ * number came from, so it is an upper bound from an easier task rather than a ceiling for this one.
  * Light/deep separation is the weakest link — deep-minute estimates are the least
  * reliable output.
  *
@@ -3346,12 +3350,31 @@ object SleepStager {
         val windowS = 5 * 60L
         val out = ArrayList<HrvWindow>()
         var t = start
+        // One advancing index instead of re-filtering `seg` per window. The CONTRACT above already
+        // guarantees ts-sorted input, so each window's beats are a CONTIGUOUS run and the scan carries on
+        // from where the previous window ended. Twin of the Swift sweep; an oracle ran both bucketings over
+        // 480 nights covering dense, sparse, duplicate-timestamp, tail-loaded, boundary and empty input and
+        // found them identical, so this changes cost and not output.
+        var i = 0
         do {
             // Final window closes on `end` — same closed-window rule as sessionRestingHR, so an
             // endpoint beat counts instead of vanishing after admission. `do` runs once for a
             // zero-length window, where that single closed window is the whole session.
             val isFinal = t + windowS >= end
-            val bucket = seg.filter { it.ts >= t && (isFinal || it.ts < t + windowS) }.map { it.rrMs.toDouble() }
+            // Defensive on the first window only: `seg` starts at or after `start`, so nothing is skipped
+            // in practice, and a later window always resumes exactly where the previous one stopped.
+            while (i < seg.size && seg[i].ts < t) i++
+            var j = i
+            if (isFinal) {
+                // The final window takes every remaining beat, matching the old `isFinal` short-circuit,
+                // which dropped the upper bound and relied on `seg` already ending at `end`.
+                j = seg.size
+            } else {
+                val upper = t + windowS
+                while (j < seg.size && seg[j].ts < upper) j++
+            }
+            val bucket = seg.subList(i, j).map { it.rrMs.toDouble() }
+            if (!isFinal) i = j
             // Full clean (range + Malik ectopic rejection), not just range — matches the
             // analyze() pipeline. The 0x2A37 RR on a WHOOP 5/MG is PPG-derived and noisier
             // than a 4.0's; rMSSD is built from SUCCESSIVE differences, so an un-rejected
