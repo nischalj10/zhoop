@@ -154,7 +154,7 @@ final class SyncLiveActivityController {
             return
         }
         guard UnitPrefs.syncLiveActivityEnabled() else {
-            live?.append(log: "Sync activity: not started — \"Strap sync in Dynamic Island\" is off in Zhoop Settings")
+            live?.append(log: "Sync activity: not started — \"Strap sync\" is off in Zhoop Settings → Live notifications")
             return
         }
         if let activity { push(activity, state); return }

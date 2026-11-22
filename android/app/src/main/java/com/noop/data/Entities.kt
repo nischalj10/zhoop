@@ -168,8 +168,11 @@ data class RrInterval(
     val synced: Int = 0,
     val ord: Int? = null,
     val srcChannel: Int? = null,
-    /** #1073 (Room v29): 1 when this beat's ts is in the FUTURE (corrupt ring time); NULL otherwise.
-     *  Marked, never deleted; `WhoopDao.rrIntervals` filters it at READ. Twin of GRDB `tsSuspect`. */
+    /** 1 when this beat is NOT to be scored; NULL otherwise. Two causes carry the same mark, because
+     *  every scoring read wants both gone and they all test `<> 1`: the beat's ts is in the FUTURE
+     *  (corrupt ring time, #1073 / Room v29), or it is a WHOOP 5/MG 500 ms fill beat (#2371 / Room v41).
+     *  The mark therefore says "excluded", never WHICH cause, so a diagnostic reading it must not claim
+     *  one. Marked, never deleted; `WhoopDao.rrIntervals` filters it at READ. Twin of GRDB `tsSuspect`. */
     val tsSuspect: Int? = null,
 )
 
@@ -410,29 +413,6 @@ data class SleepSession(
     /** The bed (onset) time to DISPLAY / sort / re-stage by: the user's hand-set onset when edited,
      *  else the immutable detected [startTs]. Mirrors Swift `CachedSleepSession.effectiveStartTs`. */
     val effectiveStartTs: Long get() = startTsAdjusted ?: startTs
-
-    /** Whole-block duration in hours (effective onset → wake). */
-    val durationHours: Double get() = (endTs - effectiveStartTs) / 3600.0
-
-    /**
-     * DERIVED nap classification (#518), computed at READ time, NO schema column / migration. A block
-     * is a nap when it is SHORT (< [NAP_MAX_HOURS]) or DAYTIME-onset (onset not in the overnight window).
-     * The day's MAIN sleep is resolved separately (the longest, overnight-preferring block, see
-     * SleepScreen.mainSleepBlock); this flag only describes the block's own shape, so the UI can label /
-     * count naps consistently with iOS SleepView.isNap. A long overnight split-sleep block is NOT a nap.
-     */
-    val isNapShaped: Boolean
-        get() {
-            val cal = java.util.Calendar.getInstance().apply { timeInMillis = effectiveStartTs * 1000L }
-            val h = cal.get(java.util.Calendar.HOUR_OF_DAY)
-            val overnightOnset = h >= 20 || h < 10
-            return durationHours < NAP_MAX_HOURS || !overnightOnset
-        }
-
-    companion object {
-        /** A block shorter than this is nap-shaped regardless of onset. Mirrors iOS SleepView.napMaxHours. */
-        const val NAP_MAX_HOURS: Double = 3.0
-    }
 }
 
 /**
@@ -728,6 +708,70 @@ data class PpgWaveformSampleEntity(
         result = 31 * result + samples.contentHashCode()
         result = 31 * result + (burstIndex ?: 0)
         result = 31 * result + (baseCode?.hashCode() ?: 0)
+        return result
+    }
+}
+
+/**
+ * One flash-banked MG ECG record, kept whole (v42 / MIGRATION_41_42, #2847). Swift `ecgWaveformSample`
+ * (WhoopStore Database.swift `v48-ecg-waveform`).
+ *
+ * `TOGGLE_LABRADOR_RAW_SAVE(125)=1` banks an MG's ECG generation to the strap's flash as type-47 /
+ * revision-16 records, which arrive in the ordinary history offload rather than on a live channel. #2839
+ * landed the decoder for them ([Whoop5Ecg.parseR16]); this is the table that decode had no home in, so
+ * every record went down the unmapped route into the bounded raw archive and was evicted from it.
+ *
+ * [record] is the record's INNER bytes verbatim, all [Whoop5Ecg.R16_INNER_LENGTH] of them, from the
+ * packet-type byte to the alignment byte. The wire form rather than a decoded field set, because:
+ * the waveform is 500 three-byte slots of signed 18-BIT samples (@meta1971 measured them reaching
+ * +/-126,977 over 13,178,493 samples), so no integer blob holds one and an i32 blob would be a third
+ * larger than the wire for no added meaning; the 22 lead-off halfwords have no attested byte order, so a
+ * decoded column would bake a guess into storage; and [Whoop5Ecg.parseR16] is already pinned
+ * byte-for-byte by `Whoop5EcgR16Test`, so the row needs no reader of its own.
+ *
+ * [sequence] is the strap's own record index, lifted out of [record] so a reading can be ordered and
+ * gap-checked in SQL without unpacking 1,572 bytes a row. Written from the same decode that produced
+ * [record], never from a second reading of those bytes.
+ *
+ * PK (deviceId, ts, SEQUENCE), which is where this table differs from every per-second stream beside it,
+ * and the difference is load-bearing. A (deviceId, ts) key assumes one record per strap-second, and R16
+ * does not keep that promise at the START of a reading: the record carries a `subseconds` field at all,
+ * and the opening records of a real run declare 0 samples and then 245 before the first full 500, so two
+ * of them can be stamped inside the same second. Keyed on the second alone, the second record of that
+ * pair hit IGNORE-on-conflict and was dropped silently. Re-offloading the same record still dedupes,
+ * because its ts AND its sequence both repeat. Fields are declared in the SAME order as the GRDB schema
+ * (deviceId, ts, sequence, record) so Room's generated shape stays byte-identical and a `.noopbak`
+ * round-trips.
+ *
+ * CAPPED, not unbounded: [WhoopRepository.ECG_WAVEFORM_RETENTION_ROWS] rolling rows per device. Newest-N
+ * rows rather than an age cutoff, and here that matters more than it does for [PpgWaveformSampleEntity]:
+ * a reading is a DISCRETE EVENT, so any wall-clock cutoff empties the table for a user who takes one a
+ * week. Swift twin: `WhoopStore.ecgWaveformRetentionRows`.
+ *
+ * NOTHING READS THESE ROWS YET, deliberately. #752 bounds what may be read off this signal at all: no
+ * rhythm classification of ours, no alerts, no clinical wording. The rows exist so a later analysis can
+ * run over the ORIGINAL samples instead of a summary invented at ingest time. Not dead code.
+ */
+@Entity(tableName = "ecgWaveformSample", primaryKeys = ["deviceId", "ts", "sequence"])
+data class EcgWaveformSampleEntity(
+    val deviceId: String,
+    val ts: Long,
+    val sequence: Long,
+    val record: ByteArray,
+) {
+    // ByteArray needs structural equals/hashCode (the generated identity ones break round-trip asserts).
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is EcgWaveformSampleEntity) return false
+        return deviceId == other.deviceId && ts == other.ts && sequence == other.sequence &&
+            record.contentEquals(other.record)
+    }
+
+    override fun hashCode(): Int {
+        var result = deviceId.hashCode()
+        result = 31 * result + ts.hashCode()
+        result = 31 * result + sequence.hashCode()
+        result = 31 * result + record.contentHashCode()
         return result
     }
 }
