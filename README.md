@@ -18,12 +18,13 @@ itself. It shows a lot.
 
 I forked it to cater to my own fitness needs. I'm on a calorie deficit, working out, and trying to get
 from where I am to a goal weight by a date. I wanted the app to answer one question every day: **how
-much can I eat today, and am I on track?** So Zhoop strips the app down to that and adds the weight-loss
-pieces NOOP doesn't have.
+much can I eat today, and am I on track?** So Zhoop adds the weight-loss pieces NOOP doesn't have.
 
 ## What's different from NOOP
 
-**Today** is rebuilt around the deficit:
+Zhoop is NOOP's full iPhone app (Today with Charge, Effort and Rest, plus Trends, Sleep, Coach and
+More), kept in sync with [NOOP upstream](https://github.com/ryanbr/noop), with one addition:
+**More → Weight Loss**, a screen built around the deficit:
 
 - **Calories left today**: a ring showing your food allowance minus what you've eaten, with your
   workout burn against its target and a protein bar.
@@ -42,12 +43,10 @@ Built for someone without a scale:
 - **Logging buffer**: counts every logged calorie 10% higher (adjustable), because most people
   under-log.
 
-And less of everything else:
+Its gear menu holds the plan settings, devices, Apple Health and settings.
 
-- Two tabs: **Today** and a simple **Sleep** tab (last night, the past 7 nights, averages).
-- Devices, Apple Health, plan settings and settings live behind the gear on Today.
-
-The Bluetooth, strap protocol, storage, sleep staging and heart-rate calorie model are NOOP's, unchanged.
+The Bluetooth, strap protocol, storage, scoring, sleep staging and heart-rate calorie model are NOOP's,
+unchanged.
 
 ## Status
 
@@ -56,7 +55,13 @@ still in the repository but have not been reworked beyond the name. Everything i
 
 ## Build and run on an iPhone
 
-Needs a Mac with Xcode and [XcodeGen](https://github.com/yonaskolb/XcodeGen).
+**Without a Mac:** in this repository's **Actions** tab, run **Testing build (fork)** on the branch
+you want. It attaches `NOOP-ios-unsigned-v<version>.ipa` to a rolling `testing-latest` prerelease.
+Open that on your iPhone and install it with [SideStore](https://sidestore.io) or AltStore, which
+signs it with your own Apple ID (re-signed every 7 days with a free one). A GitHub fork has Actions
+switched off until you enable them once in that tab.
+
+**With a Mac:** needs Xcode and [XcodeGen](https://github.com/yonaskolb/XcodeGen).
 
 1. `cp Config/BundleIdSecrets.example.xcconfig Config/BundleIdSecrets.xcconfig`, then set your own
    `BUNDLE_ID_PREFIX` and `DEVELOPMENT_TEAM` in it. That file is gitignored.
