@@ -364,6 +364,28 @@ func emptyReplyError(_ json: [String: Any]) -> AICoachError {
         + "that the model name is one the provider actually offers.")
 }
 
+// MARK: - OpenAI-compatible request shape
+
+/// The length and sampling parameters of an OpenAI-compatible chat body. Classic: `temperature` 0.6
+/// and `max_tokens`. Modern: `max_completion_tokens` and no `temperature`, the shape reasoning and
+/// newer chat models require. #1074: the 4096 cap is the same either way, a cap rather than a target,
+/// so a full multi-section reply completes. One source for the OpenAI and Custom clients, streamed and
+/// not, so the four request paths cannot drift apart. Kotlin twin: `AiCoach.openAiChatBody`.
+func openAIChatParams(modern: Bool) -> [String: Any] {
+    if modern { return ["max_completion_tokens": 4096] }
+    return ["temperature": 0.6, "max_tokens": 4096]
+}
+
+/// Whether a provider's 400 asks for the modern parameter shape: `max_completion_tokens` in place of
+/// `max_tokens`, or no `temperature`. Every OpenAI-compatible call starts in the classic shape and
+/// resends once in the modern one when this holds. `detail` is the message `providerErrorMessage`
+/// extracted from the error body. Kotlin twin: `AiCoach.shouldRetryOpenAiModernParams`.
+func asksForModernOpenAIParams(_ detail: String) -> Bool {
+    let d = detail.lowercased()
+    return d.contains("max_completion_tokens") || d.contains("max_tokens")
+        || d.contains("temperature") || d.contains("unsupported")
+}
+
 // MARK: - SSE streaming helper (K1)
 
 /// Execute a streaming SSE request, map HTTP status codes to `AICoachError`, and call `onLine`
